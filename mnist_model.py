@@ -12,7 +12,7 @@ from sklearn.svm import LinearSVC
 
 MODELS = {
     "Logistic regression": lambda seed: LogisticRegression(
-        max_iter=200, n_jobs=1, random_state=seed
+        max_iter=200, random_state=seed
     ),
     "Linear SVM": lambda seed: LinearSVC(C=0.01, random_state=seed),
     "Neural net (1x64)": lambda seed: MLPClassifier(
