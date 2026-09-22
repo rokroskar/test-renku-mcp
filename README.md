@@ -55,6 +55,29 @@ Pushing needs a GitHub token with `write:packages`, read from
 `GITHUB_TOKEN`. Nothing else in the pipeline needs a credential: the app pulls
 anonymously.
 
+## Staying current
+
+Replicas pull `:latest` at startup and re-pull every `RESULTS_TTL_SECONDS`
+(default 600), so re-running the job reaches every replica without an image
+rebuild or an app restart. A pull whose digest already matches what is on disk
+costs one manifest request and downloads nothing.
+
+The sidebar shows the bundle digest currently being served and offers a
+**Refresh results** button. The button clears the cache on the replica serving
+that session only — `st.cache_resource` is per process — which is why the TTL
+exists.
+
+If a refresh cannot reach the registry, the last good bundle keeps being
+served and the sidebar says so; downloads are staged and swapped in only once
+complete, so an interrupted pull never leaves a half-written bundle.
+
+| variable | default | meaning |
+| --- | --- | --- |
+| `RESULTS_REFERENCE` | `ghcr.io/rokroskar/test-renku-mcp/model:latest` | bundle to pull |
+| `RESULTS_TTL_SECONDS` | `600` | how often a replica re-pulls |
+| `RESULTS_CACHE` | `$TMPDIR/mnist-results` | where the bundle is cached |
+| `ARTIFACTS_DIR` | unset | serve a local directory instead of pulling |
+
 ## Running locally
 
 ```bash

@@ -29,6 +29,13 @@ DOI_URL = "https://doi.org/10.5281/zenodo.4697906"
 RESULTS_REFERENCE = os.environ.get(
     "RESULTS_REFERENCE", "ghcr.io/rokroskar/test-renku-mcp/model:latest"
 )
+# Replicas re-pull on their own schedule so that a retrain reaches all of them
+# without anyone restarting the app. A pull whose digest is unchanged costs one
+# manifest request.
+RESULTS_TTL = int(os.environ.get("RESULTS_TTL_SECONDS", "600"))
+RESULTS_CACHE = Path(
+    os.environ.get("RESULTS_CACHE", Path(tempfile.gettempdir()) / "mnist-results")
+)
 
 st.set_page_config(
     page_title="MNIST Digit Classifier Explorer",
@@ -39,19 +46,35 @@ st.set_page_config(
 
 # cache_resource, not cache_data: the arrays are never mutated, so every
 # session should share one copy rather than be handed a fresh deserialisation.
-@st.cache_resource(show_spinner="Fetching the published results…")
-def load_artifacts() -> tuple[Artifacts, str]:
-    """Prefer a local copy; otherwise pull the bundle the job published."""
+@st.cache_resource(ttl=RESULTS_TTL, show_spinner="Fetching the published results…")
+def load_artifacts() -> tuple[Artifacts, str, str | None]:
+    """Prefer a local copy, else the published bundle, else the last good pull.
+
+    Returns the artifacts, a human-readable source, and the manifest digest.
+    """
     try:
-        return Artifacts(find_artifacts_dir()), "local files"
+        return Artifacts(find_artifacts_dir()), "local files", None
     except FileNotFoundError:
-        directory = Path(tempfile.mkdtemp(prefix="mnist-results-"))
-        oci.pull(RESULTS_REFERENCE, directory)
-        return Artifacts(directory), RESULTS_REFERENCE
+        pass
+
+    try:
+        digest = oci.pull(RESULTS_REFERENCE, RESULTS_CACHE)
+        return Artifacts(RESULTS_CACHE), RESULTS_REFERENCE, digest
+    except oci.RegistryError as exc:
+        # A refresh that cannot reach the registry should not take the app
+        # down: keep serving whatever was pulled last.
+        previous = oci.local_digest(RESULTS_CACHE)
+        if previous is None:
+            raise
+        return (
+            Artifacts(RESULTS_CACHE),
+            f"{RESULTS_REFERENCE} — cached, refresh failed ({exc})",
+            previous,
+        )
 
 
 try:
-    artifacts, source = load_artifacts()
+    artifacts, source, digest = load_artifacts()
 except (FileNotFoundError, oci.RegistryError) as exc:
     st.error(
         f"No precomputed results available: {exc}\n\n"
@@ -79,10 +102,20 @@ predictions = artifacts.predictions(config)
 labels = artifacts.labels
 errors = np.flatnonzero(labels != predictions)
 
+st.sidebar.divider()
+st.sidebar.subheader("Results")
 st.sidebar.caption(
-    f"Fitted once by the Renku job in {config.fit_seconds:.0f}s, seed "
+    f"Fitted by the Renku job in {config.fit_seconds:.0f}s, seed "
     f"{artifacts.seed}. The app itself trains nothing.\n\n"
-    f"Results from `{source}`."
+    f"Source: `{source}`"
+    + (f"\n\nBundle `{digest[7:19]}`" if digest else "")
+)
+if st.sidebar.button("Refresh results", use_container_width=True):
+    load_artifacts.clear()
+    st.rerun()
+st.sidebar.caption(
+    f"Refreshing affects only the replica serving this session; every replica "
+    f"re-pulls on its own within {RESULTS_TTL // 60} min."
 )
 
 # --------------------------------------------------------------------------

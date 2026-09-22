@@ -6,7 +6,7 @@ images we do not control the dependencies of, so this speaks the registry's
 HTTP API directly rather than depending on oras or docker being present.
 
     push("ghcr.io/owner/repo/model:latest", [Path("results.npz")], token=...)
-    directory = pull("ghcr.io/owner/repo/model:latest")
+    digest = pull("ghcr.io/owner/repo/model:latest", Path("cache"))
 
 Anonymous pull needs no token. Push needs a GitHub token with write:packages.
 """
@@ -17,6 +17,7 @@ import base64
 import hashlib
 import json
 import mimetypes
+import shutil
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -189,8 +190,25 @@ def push(
 # --------------------------------------------------------------------------
 
 
-def pull(reference: str, into: Path, token: str | None = None) -> Path:
-    """Download an artifact's named layers into `into`. Returns `into`."""
+DIGEST_FILE = ".digest"
+
+
+def local_digest(directory: Path) -> str | None:
+    """The manifest digest of whatever is already in `directory`, if any."""
+    marker = directory / DIGEST_FILE
+    if marker.is_file():
+        return marker.read_text().strip() or None
+    return None
+
+
+def pull(reference: str, into: Path, token: str | None = None) -> str:
+    """Make `into` hold the artifact's named layers. Returns the manifest digest.
+
+    The download is staged in a sibling directory and swapped in only once it
+    is complete, so a failed or interrupted refresh leaves the previous copy
+    intact for the caller to keep serving. An artifact whose digest already
+    matches what is on disk is not downloaded again.
+    """
     registry, repository, tag = _split(reference)
     bearer = _token(registry, repository, "pull", token)
     auth = {"Authorization": f"Bearer {bearer}"}
@@ -215,7 +233,14 @@ def pull(reference: str, into: Path, token: str | None = None) -> Path:
             raise RegistryError(f"nested manifest GET failed ({status})")
         manifest = json.loads(payload)
 
-    into.mkdir(parents=True, exist_ok=True)
+    digest = _digest(payload)
+    if local_digest(into) == digest:
+        return digest
+
+    staging = into.parent / f"{into.name}.staging"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+
     written = 0
     for layer in manifest.get("layers", []):
         name = layer.get("annotations", {}).get("org.opencontainers.image.title")
@@ -230,9 +255,19 @@ def pull(reference: str, into: Path, token: str | None = None) -> Path:
             raise RegistryError(f"blob GET failed ({status}) for {name}")
         if _digest(blob) != layer["digest"]:
             raise RegistryError(f"digest mismatch for {name}")
-        (into / Path(name).name).write_bytes(blob)
+        (staging / Path(name).name).write_bytes(blob)
         written += 1
 
     if not written:
+        shutil.rmtree(staging, ignore_errors=True)
         raise RegistryError(f"{reference} carried no named layers")
-    return into
+
+    (staging / DIGEST_FILE).write_text(digest)
+
+    previous = into.parent / f"{into.name}.previous"
+    shutil.rmtree(previous, ignore_errors=True)
+    if into.exists():
+        into.rename(previous)
+    staging.rename(into)
+    shutil.rmtree(previous, ignore_errors=True)
+    return digest
