@@ -39,6 +39,14 @@ def read_token(token_file: Path = DEFAULT_TOKEN_FILE) -> str:
     return token
 
 
+def optional_token(token_file: Path = DEFAULT_TOKEN_FILE) -> str | None:
+    """A token if one is available, else None for an anonymous pull."""
+    try:
+        return read_token(token_file)
+    except SystemExit:
+        return None
+
+
 def resolve_input(pull: str | None, into: Path, local: Path | None) -> Path:
     """Get a step's input, from a local directory or from the registry."""
     if local is not None:
@@ -48,7 +56,9 @@ def resolve_input(pull: str | None, into: Path, local: Path | None) -> Path:
         return local
     if not pull:
         raise SystemExit("one of --in or --pull is required")
-    digest = oci.pull(pull, into)
+    # Authenticate the pull: a package a PAT has just created is private
+    # until someone makes it public, so anonymous would 401 here.
+    digest = oci.pull(pull, into, token=optional_token())
     print(f"Input: {pull} ({digest[:19]})")
     return into
 
