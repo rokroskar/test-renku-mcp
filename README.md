@@ -1,8 +1,21 @@
 # MNIST Digit Classifier Explorer
 
 A Streamlit app that shows how well a simple classifier reads handwritten
-digits, and where it goes wrong. Built to run as a
-[Renku](https://renkulab.io) app.
+digits, and where it goes wrong. Runs as a [Renku](https://renkulab.io) app.
+
+## How the pieces fit
+
+```
+Zenodo data connector ──> precompute job (Renku) ──> GHCR OCI artifact ──> app
+   read-only mount          fits 9 models             ~3 MB bundle        pulls
+```
+
+The app **fits nothing**. It is served to anonymous visitors from several
+replicas, and a replica that had to read 130 MB of TSV and fit on one core
+would take minutes to answer its first request. So every
+classifier/training-size combination is frozen once by the job and published
+as an OCI artifact next to the app image; each replica pulls that ~3 MB bundle
+at startup.
 
 ## Data
 
@@ -15,8 +28,8 @@ images, 28x28 greyscale, as headerless TSV.
 > applied to document recognition", *Proceedings of the IEEE* 86(11), 1998.
 
 The mount directory is deployment-specific, so `mnist_data.find_data_dir()`
-locates `X_train.tsv` by name under `/home/renku/work`. Set `MNIST_DATA_DIR` to
-point somewhere else.
+locates `X_train.tsv` by name under `/home/renku/work`. Set `MNIST_DATA_DIR`
+to point somewhere else.
 
 ## What the app shows
 
@@ -25,25 +38,39 @@ point somewhere else.
 - **Mistakes** — the misclassified test images, filterable by confusion pair.
 - **Inspect an image** — any test image with the model's per-digit scores.
 
-Classifier, training-set size and seed are set in the sidebar; models are
-trained on demand and cached.
+## Publishing results
 
-## Run it locally
+Run inside a Renku job, where the connector is mounted and the buildpack
+environment provides scikit-learn:
+
+```bash
+/cnb/lifecycle/launcher bash -c '
+  cd /home/renku/work/test-renku-mcp &&
+  python precompute.py --out /home/renku/work/artifacts \
+    --push ghcr.io/rokroskar/test-renku-mcp/model:latest'
+```
+
+Pushing needs a GitHub token with `write:packages`, read from
+`/secrets/ghcr_token` (a Renku user secret attached to the launcher) or from
+`GITHUB_TOKEN`. Nothing else in the pipeline needs a credential: the app pulls
+anonymously.
+
+## Running locally
 
 ```bash
 pip install -r requirements.txt
-MNIST_DATA_DIR=/path/to/record streamlit run app.py
+
+# either pull what the job published...
+streamlit run app.py
+
+# ...or precompute locally first
+pip install -r requirements-precompute.txt
+MNIST_DATA_DIR=/path/to/record python precompute.py --out artifacts
+ARTIFACTS_DIR=artifacts streamlit run app.py
 ```
 
-## Train from the command line
-
-Also runnable as a Renku job:
-
-```bash
-python train.py --model "Logistic regression" --n-train 12000 --out models
-```
-
-Writes `models/model.joblib` and `models/metrics.json`.
+`train.py` fits a single configuration and writes `model.joblib` — useful for
+poking at one model, but it is not what the app consumes.
 
 ## Charts
 

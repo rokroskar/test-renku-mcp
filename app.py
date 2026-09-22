@@ -3,72 +3,87 @@
 Data: MNIST subset published on Zenodo, DOI 10.5281/zenodo.4697906, CC-BY-4.0.
 Credit: Y. LeCun, L. Bottou, Y. Bengio, P. Haffner, "Gradient-based learning
 applied to document recognition", Proceedings of the IEEE 86(11), 1998.
+
+The app fits nothing. Every classifier/training-size combination is frozen by
+the precompute job in Renku and published to the GitHub container registry;
+the app pulls that ~3 MB bundle at startup. It is served from several
+replicas, and fitting per pod would make each cold start cost minutes.
 """
 
 from __future__ import annotations
+
+import os
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from sklearn.metrics import precision_recall_fscore_support
 
+import oci
 import sdsc_plotly_theme  # noqa: F401  -- registers and activates the "sdsc" template
-from mnist_data import as_image, find_data_dir, load_split
-from mnist_model import DIGITS, MODELS, fit_and_evaluate, subsample
+from mnist_artifacts import Artifacts, find_artifacts_dir, per_digit_metrics
 
 DOI_URL = "https://doi.org/10.5281/zenodo.4697906"
+RESULTS_REFERENCE = os.environ.get(
+    "RESULTS_REFERENCE", "ghcr.io/rokroskar/test-renku-mcp/model:latest"
+)
 
 st.set_page_config(
     page_title="MNIST Digit Classifier Explorer",
-    page_icon="🔢",
+    page_icon="\U0001F522",
     layout="wide",
 )
 
 
-@st.cache_data(show_spinner="Reading the Zenodo record…")
-def load_data():
-    data_dir = find_data_dir()
-    x_train, y_train = load_split(data_dir, "train")
-    x_test, y_test = load_split(data_dir, "test")
-    return str(data_dir), x_train, y_train, x_test, y_test
+# cache_resource, not cache_data: the arrays are never mutated, so every
+# session should share one copy rather than be handed a fresh deserialisation.
+@st.cache_resource(show_spinner="Fetching the published results…")
+def load_artifacts() -> tuple[Artifacts, str]:
+    """Prefer a local copy; otherwise pull the bundle the job published."""
+    try:
+        return Artifacts(find_artifacts_dir()), "local files"
+    except FileNotFoundError:
+        directory = Path(tempfile.mkdtemp(prefix="mnist-results-"))
+        oci.pull(RESULTS_REFERENCE, directory)
+        return Artifacts(directory), RESULTS_REFERENCE
 
 
-@st.cache_resource(show_spinner="Training…", max_entries=4)
-def train(model_name: str, n_train: int, seed: int):
-    _, x_train, y_train, x_test, y_test = load_data()
-    x_fit, y_fit = subsample(x_train, y_train, n_train, seed)
-    return fit_and_evaluate(model_name, x_fit, y_fit, x_test, y_test, seed)
+try:
+    artifacts, source = load_artifacts()
+except (FileNotFoundError, oci.RegistryError) as exc:
+    st.error(
+        f"No precomputed results available: {exc}\n\n"
+        "Run the *Train the classifier* job in the Renku project to publish "
+        "them."
+    )
+    st.stop()
 
-
-def digit_thumbnail(row: np.ndarray) -> np.ndarray:
-    """A 28x28 row as a uint8 greyscale image for st.image."""
-    return (as_image(row) * 255).astype(np.uint8)
-
+digits = artifacts.digits
 
 # --------------------------------------------------------------------------
 # Sidebar controls
 # --------------------------------------------------------------------------
 
 st.sidebar.header("Model")
-model_name = st.sidebar.selectbox("Classifier", list(MODELS))
+model_name = st.sidebar.selectbox("Classifier", artifacts.models)
 n_train = st.sidebar.select_slider(
     "Training images",
-    options=[500, 1000, 2000, 4000, 8000, 12000],
-    value=2000,
-    help="Larger is more accurate and slower to fit.",
+    options=artifacts.sizes_for(model_name),
+    value=artifacts.sizes_for(model_name)[-1],
 )
-seed = st.sidebar.number_input("Random seed", value=0, step=1)
+config = artifacts.find(model_name, int(n_train))
 
-try:
-    data_dir, x_train, y_train, x_test, y_test = load_data()
-except FileNotFoundError as exc:
-    st.error(str(exc))
-    st.stop()
+predictions = artifacts.predictions(config)
+labels = artifacts.labels
+errors = np.flatnonzero(labels != predictions)
 
-st.sidebar.caption(f"Record mounted at `{data_dir}`")
-
-result = train(model_name, int(n_train), int(seed))
+st.sidebar.caption(
+    f"Fitted once by the Renku job in {config.fit_seconds:.0f}s, seed "
+    f"{artifacts.seed}. The app itself trains nothing.\n\n"
+    f"Results from `{source}`."
+)
 
 # --------------------------------------------------------------------------
 # Header
@@ -76,16 +91,16 @@ result = train(model_name, int(n_train), int(seed))
 
 st.title("MNIST Digit Classifier Explorer")
 st.markdown(
-    f"**{result.model_name}** fitted on {result.n_train:,} of {len(y_train):,} "
-    f"training images, evaluated on all {len(y_test):,} held-out test images. "
+    f"**{config.model}** fitted on {config.n_train:,} training images and "
+    f"evaluated on all {artifacts.n_test:,} held-out test images. "
     f"Data: [MNIST subset on Zenodo]({DOI_URL}) (CC-BY-4.0)."
 )
 
 top = st.columns(4)
-top[0].metric("Test accuracy", f"{result.accuracy:.1%}")
-top[1].metric("Misclassified", f"{len(result.errors):,}")
-top[2].metric("Training images", f"{result.n_train:,}")
-top[3].metric("Test images", f"{len(result.y_true):,}")
+top[0].metric("Test accuracy", f"{config.accuracy:.1%}")
+top[1].metric("Misclassified", f"{len(errors):,}")
+top[2].metric("Training images", f"{config.n_train:,}")
+top[3].metric("Test images", f"{artifacts.n_test:,}")
 
 overview_tab, per_digit_tab, mistakes_tab, inspect_tab = st.tabs(
     ["Confusion matrix", "Per-digit accuracy", "Mistakes", "Inspect an image"]
@@ -102,13 +117,13 @@ with overview_tab:
         help="Row-normalising exposes the off-diagonal confusions that raw "
         "counts hide behind the diagonal.",
     )
-    counts = result.confusion
+    counts = config.confusion
     matrix = counts / counts.sum(axis=1, keepdims=True) if normalise else counts
 
     figure = px.imshow(
         matrix,
-        x=DIGITS,
-        y=DIGITS,
+        x=digits,
+        y=digits,
         labels={"x": "Predicted digit", "y": "True digit", "color": ""},
         aspect="equal",
         origin="upper",
@@ -119,8 +134,8 @@ with overview_tab:
         texttemplate="%{text}",
         hovertemplate="true %{y} → predicted %{x}: %{text} images<extra></extra>",
     )
-    figure.update_xaxes(tickmode="array", tickvals=DIGITS, side="bottom")
-    figure.update_yaxes(tickmode="array", tickvals=DIGITS)
+    figure.update_xaxes(tickmode="array", tickvals=digits, side="bottom")
+    figure.update_yaxes(tickmode="array", tickvals=digits)
     figure.update_layout(height=620, coloraxis_showscale=False)
     st.plotly_chart(figure, use_container_width=True)
     st.caption(
@@ -133,16 +148,14 @@ with overview_tab:
 # --------------------------------------------------------------------------
 
 with per_digit_tab:
-    precision, recall, f1, support = precision_recall_fscore_support(
-        result.y_true, result.y_pred, labels=DIGITS, zero_division=0
-    )
+    metrics = per_digit_metrics(config.confusion)
     per_digit = pd.DataFrame(
         {
-            "Digit": DIGITS,
-            "Precision": precision,
-            "Recall": recall,
-            "F1": f1,
-            "Test images": support,
+            "Digit": digits,
+            "Precision": metrics["precision"],
+            "Recall": metrics["recall"],
+            "F1": metrics["f1"],
+            "Test images": metrics["support"],
         }
     )
 
@@ -160,7 +173,7 @@ with per_digit_tab:
         barmode="group",
         pattern_shape="Metric",  # readable without colour
     )
-    figure.update_xaxes(tickmode="array", tickvals=DIGITS)
+    figure.update_xaxes(tickmode="array", tickvals=digits)
     figure.update_yaxes(range=[0, 1], tickformat=".0%")
     figure.update_layout(height=440)
     st.plotly_chart(figure, use_container_width=True)
@@ -181,29 +194,26 @@ with per_digit_tab:
 # Mistakes
 # --------------------------------------------------------------------------
 
+
+def thumbnail(index: int) -> np.ndarray:
+    return artifacts.images[index].reshape(28, 28)
+
+
 with mistakes_tab:
-    errors = result.errors
     if len(errors) == 0:
         st.success("No misclassified test images.")
     else:
-        pair_options = ["Any"] + [
-            f"{t} read as {p}"
-            for t, p in sorted(
-                {(int(result.y_true[i]), int(result.y_pred[i])) for i in errors}
-            )
-        ]
-        chosen = st.selectbox("Confusion", pair_options)
+        pairs = sorted({(int(labels[i]), int(predictions[i])) for i in errors})
+        options = ["Any"] + [f"{t} read as {p}" for t, p in pairs]
+        chosen = st.selectbox("Confusion", options)
+
         shown = errors
         if chosen != "Any":
             true_digit, pred_digit = int(chosen[0]), int(chosen[-1])
-            shown = np.array(
-                [
-                    i
-                    for i in errors
-                    if result.y_true[i] == true_digit
-                    and result.y_pred[i] == pred_digit
-                ]
-            )
+            shown = errors[
+                (labels[errors] == true_digit)
+                & (predictions[errors] == pred_digit)
+            ]
 
         st.write(f"{len(shown):,} misclassified images; showing up to 24.")
         for block in np.array_split(shown[:24], 4):
@@ -211,9 +221,9 @@ with mistakes_tab:
                 continue
             for column, index in zip(st.columns(6), block):
                 column.image(
-                    digit_thumbnail(x_test[index]),
-                    caption=f"#{index} · is {result.y_true[index]}, "
-                    f"read {result.y_pred[index]}",
+                    thumbnail(index),
+                    caption=f"#{index} · is {labels[index]}, "
+                    f"read {predictions[index]}",
                     width=90,
                 )
 
@@ -231,12 +241,12 @@ with inspect_tab:
     controls = st.columns([2, 1, 1])
     if controls[1].button("Random image", use_container_width=True):
         st.session_state.pending_index = int(
-            np.random.default_rng().integers(len(y_test))
+            np.random.default_rng().integers(artifacts.n_test)
         )
     if controls[2].button("Random mistake", use_container_width=True):
-        if len(result.errors):
+        if len(errors):
             st.session_state.pending_index = int(
-                np.random.default_rng().choice(result.errors)
+                np.random.default_rng().choice(errors)
             )
         else:
             st.toast("This model got every test image right.")
@@ -244,18 +254,18 @@ with inspect_tab:
     index = controls[0].number_input(
         "Test image index",
         min_value=0,
-        max_value=len(y_test) - 1,
-        value=min(st.session_state.pending_index, len(y_test) - 1),
+        max_value=artifacts.n_test - 1,
+        value=min(st.session_state.pending_index, artifacts.n_test - 1),
         step=1,
     )
     st.session_state.pending_index = int(index)
-
     index = int(index)
+
     left, right = st.columns([1, 2])
     with left:
-        st.image(digit_thumbnail(x_test[index]), width=240)
-        truth = int(result.y_true[index])
-        prediction = int(result.y_pred[index])
+        st.image(thumbnail(index), width=240)
+        truth = int(labels[index])
+        prediction = int(predictions[index])
         st.metric("True digit", truth)
         st.metric(
             "Predicted digit",
@@ -265,26 +275,29 @@ with inspect_tab:
         )
 
     with right:
-        if result.scores is None:
+        values = artifacts.scores(config)[index]
+        if config.scores_are_probabilities:
+            title, axis_format, axis_range = (
+                "Predicted probability per digit",
+                ".0%",
+                [0, 1],
+            )
+        else:
             st.info(
-                f"{result.model_name} reports decision margins rather than "
+                f"{config.model} reports decision margins rather than "
                 "calibrated probabilities."
             )
-            margins = result.estimator.decision_function(
-                x_test[index : index + 1]
-            ).ravel()
-            frame = pd.DataFrame({"Digit": DIGITS, "Value": margins})
-            title, fmt = "Decision margin per digit", None
-        else:
-            frame = pd.DataFrame(
-                {"Digit": DIGITS, "Value": result.scores[index]}
+            title, axis_format, axis_range = (
+                "Decision margin per digit",
+                None,
+                None,
             )
-            title, fmt = "Predicted probability per digit", ".0%"
 
         # One variable, so one colour: hue here would encode nothing.
+        frame = pd.DataFrame({"Digit": digits, "Value": values})
         figure = px.bar(frame, x="Digit", y="Value", title=title)
-        figure.update_xaxes(tickmode="array", tickvals=DIGITS)
-        if fmt:
-            figure.update_yaxes(range=[0, 1], tickformat=fmt)
+        figure.update_xaxes(tickmode="array", tickvals=digits)
+        if axis_format:
+            figure.update_yaxes(range=axis_range, tickformat=axis_format)
         figure.update_layout(height=420, showlegend=False)
         st.plotly_chart(figure, use_container_width=True)

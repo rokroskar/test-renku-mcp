@@ -4,6 +4,10 @@
 # The app code lives in /app rather than /home/renku/work: Renku mounts the
 # project's data connectors into the work directory, which would shadow
 # anything baked in there.
+#
+# No results are baked in: the precompute job in Renku publishes them to GHCR
+# and the app pulls that ~3 MB bundle at startup, so retraining never needs an
+# image rebuild. Set ARTIFACTS_DIR to serve a local copy instead.
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -18,7 +22,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py mnist_data.py mnist_model.py sdsc_plotly_theme.py train.py ./
+COPY app.py mnist_artifacts.py oci.py sdsc_plotly_theme.py ./
 
 RUN mkdir -p /home/renku/work && chown -R 1000:1000 /home/renku /app
 

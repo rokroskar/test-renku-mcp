@@ -1,6 +1,6 @@
+# Runtime dependencies for the app. It fits nothing, so scikit-learn and scipy
+# are deliberately absent -- see requirements-precompute.txt.
 streamlit==1.40.2
 pandas==2.2.3
 numpy==2.1.3
-scikit-learn==1.5.2
 plotly==5.24.1
-joblib==1.4.2
